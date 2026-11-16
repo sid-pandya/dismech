@@ -35,6 +35,7 @@ from dismech.preflight_dr import (
     default_lexicon,
     extract_gene_mentions,
     extract_omim_ids,
+    extract_omim_gene_ids,
     fetch_mondo_record,
     find_rival_diseases,
     format_report,
@@ -154,6 +155,61 @@ def test_extract_gene_mentions_matches_c_orf_symbols():
 def test_extract_omim_ids_handles_common_prose_forms():
     text = "OMIM:616291 and MIM #605282 and (OMIM 218340)"
     assert extract_omim_ids(text) == {"616291", "605282", "218340"}
+
+
+def test_extract_omim_ids_bare_phenotype_sigils():
+    """Bare phenotype sigils (# and %) with no prefix must be extracted (#10458)."""
+    assert extract_omim_ids("the phenotype #619463") == {"619463"}
+    assert extract_omim_ids("SCA1 (#164400)") == {"164400"}
+    assert extract_omim_ids("locus %310200 confirmed") == {"310200"}
+    assert extract_omim_ids("mix of #619463 and %310200") == {"619463", "310200"}
+
+
+def test_extract_omim_ids_markdown_emphasis_and_escapes():
+    """Markdown emphasis (**, __) and backslash escapes between prefix and number (#10458)."""
+    assert extract_omim_ids("OMIM: **535000**") == {"535000"}
+    assert extract_omim_ids("MIM number **619422**") == {"619422"}
+    assert extract_omim_ids(r"OMIM: __535000__") == {"535000"}
+
+
+def test_extract_omim_ids_gene_sigils_and_separation():
+    """Gene sigils (* and +) are kept separate from phenotype MIMs (#10458)."""
+    text = r"cites OMIM *300822 and OMIM \*610008 and bare *300821 and +123456"
+    assert extract_omim_ids(text) == set()
+    assert extract_omim_gene_ids(text) == {"300822", "610008", "300821", "123456"}
+    assert extract_omim_ids(text, include_genes=True) == {"300822", "610008", "300821", "123456"}
+
+
+def test_extract_omim_ids_negative_controls():
+    """Negative controls must not produce false-positive OMIM IDs (#10458)."""
+    assert extract_omim_ids("a 45% response, 123456 cells") == set()
+    assert extract_omim_ids("+ 123456 items") == set()
+    assert extract_omim_ids("PMID **37963421**") == set()
+    assert extract_omim_ids("MONDO:0030397") == set()
+    assert extract_omim_gene_ids("a 45% response, 123456 cells") == set()
+    assert extract_omim_gene_ids("+ 123456 items") == set()
+    assert extract_omim_gene_ids("PMID **37963421**") == set()
+    assert extract_omim_gene_ids("MONDO:0030397") == set()
+
+
+def test_report_citing_only_gene_mims_does_not_downgrade_pass_to_warn():
+    """Reports citing only gene MIMs do not trigger false mismatch WARNs (#10458)."""
+    text = "CHSY1 is the causal gene. Mentions OMIM *300822 and *300824 in gene list."
+    counts = Counter({"CHSY1": 15})
+    phenotype_omim = extract_omim_ids(text)
+    gene_omim = extract_omim_gene_ids(text)
+    assert phenotype_omim == set()
+    assert gene_omim == {"300822", "300824"}
+
+    result = assess(
+        REC_TEMTAMY_PREAXIAL,
+        counts,
+        phenotype_omim,
+        report_gene_omim=gene_omim,
+    )
+    assert result.verdict == PASS
+    assert result.report_gene_omim == ["300822", "300824"]
+    assert result.report_omim == []
 
 
 def test_heuristic_lexicon_rejects_common_non_gene_acronyms():

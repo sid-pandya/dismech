@@ -119,9 +119,25 @@ GENE_TOKEN_RE = re.compile(
 # gene-frequency comparison is meaningless rather than damning.
 CURIE_SHAPED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*:\S+$")
 
-# OMIM / MIM identifiers as they appear in DR prose: "OMIM:616291", "OMIM 616291",
-# "MIM #605282", "(MIM 616354)".
-OMIM_RE = re.compile(r"\b(?:OMIM|MIM)\s*[:#\s]\s*#?\s*(\d{6})\b", re.IGNORECASE)
+# Markdown emphasis (**, __) and backslash escapes sit between the prefix
+# and the number in DR prose: "OMIM: **535000**", r"OMIM \*610008". Normalize them first.
+EMPHASIS_RE = re.compile(r"\*\*|__|\\")
+
+# '#' and '%' key a phenotype entry; '*' and '+' key a gene entry; '^' is moved/removed.
+# MONDO xrefs phenotype MIMs, so only the phenotype set is comparable to record.omim_ids --
+# a gene MIM in that comparison set can only ever manufacture a false mismatch WARN.
+# Whitespace is strictly disallowed between a bare sigil and its digits to avoid false
+# positives on table percentages ("45% 123456") or markdown list bullets ("+ 123456").
+PHENOTYPE_SIGIL_RE = re.compile(r"(?<![\w:])[#%](\d{6})(?!\d)")
+GENE_SIGIL_RE = re.compile(r"(?<![\w:])[*+](\d{6})(?!\d)")
+
+# Prefixed OMIM / MIM identifiers as they appear in DR prose: "OMIM:616291", "OMIM 616291",
+# "MIM #605282", "(MIM 616354)", "OMIM: 535000", "MIM number 619422", "OMIM *300822".
+OMIM_PREFIXED_RE = re.compile(
+    r"\b(?:OMIM|MIM)(?:\s+(?:number|id|entry|no\.?))?\s*[:#\s]?\s*([#%*+]?)\s*(\d{6})(?!\d)",
+    re.IGNORECASE,
+)
+OMIM_RE = OMIM_PREFIXED_RE
 
 # Ontology/database CURIEs (HP:0001250, GO:0007179, PMID:12345678, MONDO:0014572).
 # These must be stripped before gene tokens are counted: several ontology prefixes
@@ -253,6 +269,7 @@ class PreflightResult:
     rival_genes: list[tuple[str, int]]
     expected_omim: list[str]
     report_omim: list[str]
+    report_gene_omim: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     lexicon: str = "hgnc"
     #: Why a degraded lexicon is in use, if it is. Empty for a live HGNC run
@@ -454,9 +471,34 @@ def extract_gene_mentions(text: str, lexicon=None) -> Counter:
     return counts
 
 
-def extract_omim_ids(text: str) -> set[str]:
-    """Return the six-digit OMIM/MIM identifiers cited in ``text``."""
-    return set(OMIM_RE.findall(text))
+def extract_omim_ids(text: str, *, include_genes: bool = False) -> set[str]:
+    """Return the six-digit OMIM/MIM identifiers cited in ``text``.
+
+    By default, returns phenotype MIM numbers (bare `#`, `%`, or prefixed
+    without gene sigils) suitable for comparing against MONDO disease xrefs.
+    Pass ``include_genes=True`` to include gene MIM numbers (`*`, `+`).
+    """
+    cleaned = EMPHASIS_RE.sub("", text)
+    phenotypes = set(PHENOTYPE_SIGIL_RE.findall(cleaned))
+    genes = set(GENE_SIGIL_RE.findall(cleaned))
+    for sigil, digits in OMIM_PREFIXED_RE.findall(cleaned):
+        if sigil in ("*", "+"):
+            genes.add(digits)
+        else:
+            phenotypes.add(digits)
+    if include_genes:
+        return phenotypes | genes
+    return phenotypes
+
+
+def extract_omim_gene_ids(text: str) -> set[str]:
+    """Return only gene OMIM identifiers (`*`, `+`) cited in ``text``."""
+    cleaned = EMPHASIS_RE.sub("", text)
+    genes = set(GENE_SIGIL_RE.findall(cleaned))
+    for sigil, digits in OMIM_PREFIXED_RE.findall(cleaned):
+        if sigil in ("*", "+"):
+            genes.add(digits)
+    return genes
 
 
 def _is_curie_shaped(value: str) -> bool:
@@ -1096,6 +1138,7 @@ def assess(
     gene_counts: Counter,
     report_omim: set[str] | None = None,
     *,
+    report_gene_omim: set[str] | None = None,
     report: str = "",
     min_signal: int = DEFAULT_MIN_SIGNAL,
     rival_ratio: float = DEFAULT_RIVAL_RATIO,
@@ -1120,6 +1163,7 @@ def assess(
         record,
         gene_counts,
         report_omim,
+        report_gene_omim=report_gene_omim,
         report=report,
         min_signal=min_signal,
         rival_ratio=rival_ratio,
@@ -1154,6 +1198,7 @@ def _assess_gene_mentions(
     gene_counts: Counter,
     report_omim: set[str] | None = None,
     *,
+    report_gene_omim: set[str] | None = None,
     report: str = "",
     min_signal: int = DEFAULT_MIN_SIGNAL,
     rival_ratio: float = DEFAULT_RIVAL_RATIO,
@@ -1163,6 +1208,7 @@ def _assess_gene_mentions(
 ) -> PreflightResult:
     """The gene-mention comparison behind :func:`assess`."""
     report_omim = report_omim or set()
+    report_gene_omim = report_gene_omim or set()
     expected = list(record.genes)
     unresolved = set(record.unresolved_genes)
     resolvable = [g for g in expected if g not in unresolved]
@@ -1204,6 +1250,7 @@ def _assess_gene_mentions(
         rival_genes=rivals[:10],
         expected_omim=list(record.omim_ids),
         report_omim=sorted(report_omim),
+        report_gene_omim=sorted(report_gene_omim),
         lexicon=lexicon_name,
         lexicon_note=lexicon_note,
         alias_mentions=alias_mentions,
@@ -1479,6 +1526,7 @@ def preflight(
         record,
         counts,
         extract_omim_ids(text),
+        report_gene_omim=extract_omim_gene_ids(text),
         report=str(report_path),
         min_signal=min_signal,
         rival_ratio=rival_ratio,
@@ -1524,6 +1572,10 @@ def format_report(result: PreflightResult) -> str:
         )
         lines.append(
             f"  OMIM (report)   : {', '.join(result.report_omim[:8]) or '-'}"
+        )
+    if result.report_gene_omim:
+        lines.append(
+            f"  OMIM genes      : {', '.join(result.report_gene_omim[:8])}"
         )
     for symbol, diseases in result.rival_diseases.items():
         for mondo_id, label in diseases:
